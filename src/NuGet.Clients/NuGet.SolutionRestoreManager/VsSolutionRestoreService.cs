@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.IO;
@@ -41,6 +42,9 @@ namespace NuGet.SolutionRestoreManager
         private readonly ISolutionRestoreWorker _restoreWorker;
         private readonly ILogger _logger;
         private readonly Microsoft.VisualStudio.Threading.AsyncLazy<IVsSolution2> _vsSolution2;
+
+        private readonly ConcurrentQueue<IVsProjectRestoreInfoSource> _projectRestoreInfoSources = new();
+        private bool _hasNominationBeenCalledAtLeastOnce = false;
 
         [ImportingConstructor]
         public VsSolutionRestoreService(
@@ -150,6 +154,7 @@ namespace NuGet.SolutionRestoreManager
 
             try
             {
+                _hasNominationBeenCalledAtLeastOnce = true;
                 _logger.LogInformation(
                     $"The nominate API is called for '{projectUniqueName}'.");
 
@@ -180,6 +185,12 @@ namespace NuGet.SolutionRestoreManager
                 }
 
                 _projectSystemCache.AddProjectRestoreInfo(projectNames, dgSpec, nominationErrors);
+
+                // Prime any scheduled caching.
+                while (_projectRestoreInfoSources.TryDequeue(out var source))
+                {
+                    await AddRestoreInfoToCache(source, CancellationToken.None);
+                }
 
                 // returned task completes when scheduled restore operation completes.
                 var restoreTask = _restoreWorker.ScheduleRestoreAsync(
@@ -333,9 +344,20 @@ namespace NuGet.SolutionRestoreManager
                 throw new ArgumentNullException(Resources.Argument_Cannot_Be_Null_Or_Empty, $"{nameof(restoreInfoSource)}.{nameof(restoreInfoSource.Name)}");
             }
 
+            if (_hasNominationBeenCalledAtLeastOnce)
+            {
+                await AddRestoreInfoToCache(restoreInfoSource, token);
+            }
+            else
+            {
+                _projectRestoreInfoSources.Enqueue(restoreInfoSource);
+            }
+        }
+
+        private async Task AddRestoreInfoToCache(IVsProjectRestoreInfoSource restoreInfoSource, CancellationToken token)
+        {
             string projectUniqueName = restoreInfoSource.Name;
             ProjectNames projectNames = await GetProjectNamesAsync(projectUniqueName, token);
-
             _projectSystemCache.AddProjectRestoreInfoSource(projectNames, restoreInfoSource);
         }
 
